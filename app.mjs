@@ -1,35 +1,31 @@
 import {emptyLibrary,validateLibrary,normalize,unplayed,sorted,needsPrediction,addGames,rateGame,createRequest,importPredictions,parseJSON,markdown,randomGame} from './core.mjs';
-import {DriveSync} from './drive.mjs';
-const $=id=>document.getElementById(id), KEY='proximo-jogo.library.v1', CONFIG='proximo-jogo.google.v1';
-let data=emptyLibrary(), raw=null, config={}, view='backlog', page=0, shown=[], toastTimer, syncTimer, drive, fatal=false;
+const $=id=>document.getElementById(id), KEY='proximo-jogo.library.v1';
+let data=emptyLibrary(), raw=null, view='backlog', page=0, shown=[], toastTimer, fatal=false;
 const PAGE_SIZE=30;
 const promptPreview=document.createElement('details');promptPreview.hidden=true;promptPreview.innerHTML='<summary>Ver ou copiar o pedido exportado</summary><label for="prompt-preview">Pedido completo para o ChatGPT</label><textarea id="prompt-preview" rows="8" readonly></textarea>';$('request-status').after(promptPreview);
 function toast(message,error=false) { const el=$('toast'); (document.querySelector('dialog[open]')||document.body).append(el);el.textContent=message;el.className=error?'error':'';el.hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.hidden=true,error?14000:6500); }
 const guard=fn=>async event=>{try{await fn(event);}catch(error){toast(error.message||'Não foi possível concluir. Seus dados anteriores foram preservados.',true);}};
 function download(name,text,type='application/json') { const url=URL.createObjectURL(new Blob([text],{type}));const link=document.createElement('a');link.href=url;link.download=name;link.click();setTimeout(()=>URL.revokeObjectURL(url),2000); }
-function saveConfig() { localStorage.setItem(CONFIG,JSON.stringify(config)); }
 function dialog(id) { $('toast').hidden=true;$(id).showModal(); }
 function close(id) { if($('toast').parentElement===$(id))document.body.append($('toast'));$(id).close(); }
 for(const el of document.querySelectorAll('[data-close]')) el.onclick=()=>close(el.closest('dialog').id);
 for(const el of document.querySelectorAll('dialog')) el.addEventListener('close',()=>{if($('toast').parentElement===el)document.body.append($('toast'));});
 try {
   raw=localStorage.getItem(KEY); if(raw) data=validateLibrary(JSON.parse(raw));
-  config=JSON.parse(localStorage.getItem(CONFIG)||'{}');
+  localStorage.removeItem('proximo-jogo.google.v1');
 } catch(error) { fatal=true;toast('Não foi possível ler seus dados locais. Eles não foram apagados. Exporte o backup para recuperação antes de importar uma biblioteca válida.',true); }
-drive=new DriveSync(config);
 async function commit(transform,{allowRecovery=false}={}) {
-  if(fatal&&!allowRecovery)throw new Error('Os dados locais precisam ser recuperados. Use Conexões & backup.');
+  if(fatal&&!allowRecovery)throw new Error('Os dados locais precisam ser recuperados. Use Dados & backup.');
   const operation=async()=>{
     const current=localStorage.getItem(KEY);
     if(current!==raw) {raw=current;data=current?validateLibrary(JSON.parse(current)):emptyLibrary();render();throw new Error('Outra aba alterou a biblioteca. Os dados foram recarregados; repita sua ação.');}
     const next=transform(structuredClone(data));next.revision=Math.max(data.revision,next.revision)+1;validateLibrary(next);
-    const changedMarkdown=markdown(data)!==markdown(next);
     const serialized=JSON.stringify(next);localStorage.setItem(KEY,serialized);raw=serialized;data=next;fatal=false;
-    config.dirty=!!config.dirty||changedMarkdown;saveConfig();render();if(changedMarkdown)scheduleSync();
+    render();
   };
   if(navigator.locks)await navigator.locks.request(KEY,operation);else await operation();
 }
-window.addEventListener('storage',event=>{if(event.key===KEY && event.newValue!==raw){try{data=event.newValue?validateLibrary(JSON.parse(event.newValue)):emptyLibrary();raw=event.newValue;render();toast('Biblioteca atualizada em outra aba.');}catch{fatal=true;toast('Outra aba gravou dados inválidos. Edições foram pausadas.',true);}}if(event.key===CONFIG){try{config=JSON.parse(event.newValue||'{}');drive.config=config;renderDrive();}catch{}}});
+window.addEventListener('storage',event=>{if(event.key===KEY && event.newValue!==raw){try{data=event.newValue?validateLibrary(JSON.parse(event.newValue)):emptyLibrary();raw=event.newValue;render();toast('Biblioteca atualizada em outra aba.');}catch{fatal=true;toast('Outra aba gravou dados inválidos. Edições foram pausadas.',true);}}});
 function render() {
   const backlog=unplayed(data), rated=data.games.filter(g=>g.rating!==null);
   $('stat-backlog').textContent=backlog.length.toLocaleString('pt-BR');$('stat-rated').textContent=rated.length.toLocaleString('pt-BR');
@@ -61,27 +57,7 @@ function render() {
   $('random-button').disabled=backlog.length===0;
   const requests=data.requests.filter(r=>r.profileVersion===data.profileVersion);
   $('request-status').textContent=`${requests.length} pedidos em andamento · ${requests.reduce((n,r)=>n+r.ids.length,0)} jogos aguardando resposta.`;
-  renderDrive();
-}
-function renderDrive(message,error=false) {
-  const connected=drive?.connected();
-  $('drive-dot').className=`status-dot ${error?'error':connected?'connected':''}`;
-  $('drive-status').textContent=message || (fatal?'Atenção: armazenamento local precisa de recuperação':connected?(config.fileId?(config.dirty?'Salvo localmente · alterações pendentes no Drive':`Drive atualizado${config.lastSync?' · '+new Date(config.lastSync).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}):''}`):'Google conectado · selecione seu arquivo .md'):(config.fileId?'Salvo localmente · reconecte o Drive para sincronizar':'Salvo neste navegador · Drive não conectado'));
-  $('drive-target').textContent=config.fileId?`Destino: ${config.fileName || config.fileId}${config.lastSync?' · último envio '+new Date(config.lastSync).toLocaleString('pt-BR'):''}`:'Nenhum arquivo autorizado.';
-  $('choose-drive').disabled=!connected;$('auto-sync').checked=!!config.autoSync;
-}
-function scheduleSync() {clearTimeout(syncTimer);if(config.autoSync && config.dirty && drive.connected() && config.fileId)syncTimer=setTimeout(()=>syncDrive().catch(e=>{renderDrive(e.message,true);toast(e.message,true);}),1800);}
-async function syncDrive() {
-  if(!data.games.length)throw new Error('Importe ou adicione jogos antes de substituir o arquivo no Drive.');
-  if(!drive.connected() || !config.fileId){if(!$('settings-dialog').open)openSettings();throw new Error('Conecte o Google e selecione o arquivo .md antes de sincronizar.');}
-  if(drive.busy){scheduleSync();return;}
-  const revision=data.revision, syncingDrive=drive, destination=config.fileId;renderDrive('Enviando Markdown para o Drive…');
-  try {
-    const result=await drive.sync(markdown(data),config.remoteVersion);
-    if(drive!==syncingDrive || config.fileId!==destination)throw new Error('O envio terminou no destino anterior, mas a conexão mudou. Confira o arquivo antes de sincronizar o novo destino.');
-    config.remoteVersion=result.version;config.lastSync=new Date().toISOString();config.dirty=data.revision!==revision;saveConfig();renderDrive();
-    if(config.dirty)scheduleSync();
-  }catch(error){config.dirty=true;saveConfig();renderDrive(error.message,true);throw error;}
+  $('local-status').textContent=fatal?'Armazenamento precisa de recuperação. Abra Dados & backup.':'Salvo neste navegador · faça backups para guardar suas avaliações.';
 }
 function openRating(game) { $('rating-id').value=game.id;$('rating-game').textContent=game.title;$('rating-score').value=game.rating??'';$('rating-comment').value=game.comment;dialog('rating-dialog'); }
 function showDetail(game,random) {
@@ -93,7 +69,7 @@ function showDetail(game,random) {
   $('detail-rate').onclick=()=>{close('detail-dialog');openRating(game);};$('detail-random').hidden=!random;if(!$('detail-dialog').open)dialog('detail-dialog');
 }
 function draw() { const min=Number($('min-score').value),search=normalize($('search').value);const pool=unplayed(data).filter(g=>normalize(g.title).includes(search)&&(!min||(g.prediction?.score??-1)>=min)&&(view!=='pending'||needsPrediction(data,g)));const game=randomGame(pool);if(!game)throw new Error('Nenhum jogo não avaliado atende aos filtros atuais.');showDetail(game,true); }
-function openSettings() {$('google-client').value=config.clientId||'';$('google-key').value=config.apiKey||'';$('google-project').value=config.projectNumber||'';$('oauth-origin').textContent=location.origin;renderDrive();dialog('settings-dialog');}
+function openSettings() {dialog('settings-dialog');}
 $('add-button').onclick=()=>dialog('add-dialog');$('ai-button').onclick=()=>dialog('ai-dialog');$('settings-button').onclick=openSettings;
 $('profile-button').onclick=()=>{$('profile-text').value=data.profile;dialog('profile-dialog');};
 $('random-button').onclick=guard(draw);$('detail-random').onclick=guard(draw);
@@ -108,33 +84,13 @@ for(const id of ['import-backup','welcome-import'])$(id).onclick=()=>$('backup-f
 $('backup-file').onchange=guard(async event=>{
   const file=event.target.files[0];event.target.value='';if(!file)return;if(file.size>15_000_000)throw new Error('Limite de arquivo: 15 MB.');
   const incoming=validateLibrary(parseJSON(await file.text()));
-  if((data.games.length||fatal)&&!confirm(`Substituir sua biblioteca local de ${data.games.length} registros por ${incoming.games.length} registros? Um backup anterior será baixado. A sincronização automática será pausada até você conferir os dados.`))return;
+  if((data.games.length||fatal)&&!confirm(`Substituir sua biblioteca local de ${data.games.length} registros por ${incoming.games.length} registros? Um backup anterior será baixado.`))return;
   if(data.games.length||fatal)download('biblioteca-antes-da-importacao.json',fatal&&raw?raw:JSON.stringify(data,null,2));
-  config.autoSync=false;saveConfig();await commit(()=>incoming,{allowRecovery:true});page=0;render();toast(`${incoming.games.length} registros importados. Drive automático pausado; confira antes de ativar.`);
+  await commit(()=>incoming,{allowRecovery:true});page=0;render();toast(`${incoming.games.length} registros importados.`);
 });
-$('export-ai').onclick=guard(async()=>{let batch;await commit(current=>{batch=createRequest(current,$('ai-scope').value);return batch.data;});$('prompt-preview').value=batch.prompt;promptPreview.hidden=false;download(`pedido-chatgpt-${batch.request.id.slice(0,8)}.md`,batch.prompt,'text/markdown;charset=utf-8');toast(`Pedido com ${batch.count} jogos exportado. ${batch.remaining} ainda disponíveis para outros lotes.`);});
+$('export-ai').onclick=guard(async()=>{if(data.requests.length&&!confirm('Gerar um novo pedido único? Respostas dos pedidos anteriores deixarão de ser aceitas. Suas notas e previsões serão preservadas.'))return;let batch;await commit(current=>{batch=createRequest(current,$('ai-scope').value);return batch.data;});$('prompt-preview').value=batch.prompt;promptPreview.hidden=false;download(`pedido-chatgpt-${batch.request.id.slice(0,8)}.md`,batch.prompt,'text/markdown;charset=utf-8');toast(`Pedido único com ${batch.count} jogos exportado. Anexe ao ChatGPT e envie o comando indicado.`);});
 async function importAI(text) {let result;await commit(current=>{result=importPredictions(current,text);return result.data;});$('ai-response').value='';toast(`${result.updated} previsões atualizadas.${result.remaining?' Restam '+result.remaining+' jogos neste pedido.':''}`);}
 $('import-ai').onclick=guard(()=>importAI($('ai-response').value));$('upload-ai').onclick=()=>$('ai-file').click();
 $('ai-file').onchange=guard(async event=>{const file=event.target.files[0];event.target.value='';if(!file)return;if(file.size>15_000_000)throw new Error('Limite: 15 MB.');await importAI(await file.text());});
-$('clear-requests').onclick=guard(async()=>{if(!data.requests.length)return;if(!confirm('Descartar os pedidos em andamento? Respostas desses pedidos não poderão mais ser importadas. Nenhuma nota atual será alterada.'))return;await commit(current=>{current.requests=[];return current;});toast('Pedidos descartados. Você pode exportar novos lotes.');});
-$('google-config').onsubmit=guard(async event=>{
-  event.preventDefault();drive.disconnect();config={...config,clientId:$('google-client').value.trim(),apiKey:$('google-key').value.trim(),projectNumber:$('google-project').value.trim(),autoSync:false};saveConfig();drive=new DriveSync(config);
-  $('connect-drive').disabled=true;renderDrive('Preparando conexão Google…');await drive.load();$('connect-drive').disabled=false;renderDrive('Google preparado · clique em Conectar Google Drive');toast('Configuração salva. Clique em Conectar Google Drive.');
-});
-$('connect-drive').onclick=guard(async()=>{await drive.authorize();renderDrive();toast('Google conectado. Selecione o arquivo Markdown, se ainda não selecionou.');scheduleSync();});
-$('choose-drive').onclick=guard(async()=>{
-  // Native HTML dialogs are modal top-layer elements; close before Google's iframe picker.
-  close('settings-dialog');let doc;
-  try{doc=await drive.chooseFile();}catch(error){openSettings();throw error;}
-  const meta=await drive.metadata(doc.id);
-  if(!meta.name.endsWith('.md')||meta.mimeType.startsWith('application/vnd.google-apps.')||meta.trashed||!meta.capabilities?.canEdit)throw new Error('Escolha um arquivo .md editável.');
-  if(!confirm(`Autorizar a substituição do conteúdo de "${meta.name}" pela fila desta biblioteca? O link e as permissões serão preservados. O arquivo não será alterado até você sincronizar ou ativar o envio automático.`)){openSettings();return;}
-  config.fileId=doc.id;config.fileName=meta.name;config.remoteVersion=meta.version;config.dirty=true;config.lastSync=null;saveConfig();drive.config=config;openSettings();scheduleSync();
-});
-$('disconnect-drive').onclick=guard(()=>{drive.disconnect();config.autoSync=false;saveConfig();clearTimeout(syncTimer);renderDrive();toast('Google desconectado. Seus dados locais foram mantidos.');});
-$('auto-sync').onchange=guard(event=>{config.autoSync=event.target.checked;saveConfig();scheduleSync();renderDrive();if(config.autoSync&&!drive.connected())toast('Sincronização automática ativada, mas aguardando conexão Google.');});
-$('sync-button').onclick=guard(syncDrive);
-window.addEventListener('online',scheduleSync);window.addEventListener('focus',()=>{renderDrive();scheduleSync();});
-document.addEventListener('visibilitychange',()=>{if(!document.hidden){renderDrive();scheduleSync();}});
+$('clear-requests').onclick=guard(async()=>{if(!data.requests.length)return;if(!confirm('Descartar os pedidos em andamento? Respostas desses pedidos não poderão mais ser importadas. Nenhuma nota atual será alterada.'))return;await commit(current=>{current.requests=[];return current;});toast('Pedido descartado. Você pode gerar outro.');});
 render();
-if(config.clientId&&config.apiKey&&config.projectNumber)drive.load().then(()=>{$('connect-drive').disabled=false;}).catch(error=>renderDrive(error.message,true));
