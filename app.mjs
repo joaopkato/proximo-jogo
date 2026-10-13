@@ -1,4 +1,8 @@
 import {emptyLibrary,validateLibrary,normalize,unplayed,sorted,needsPrediction,addGames,rateGame,createRequest,importPredictions,parseJSON,markdown,randomGame} from './core.mjs';
+import {GitHubLibrary,publicLibrary,comparable,fingerprint,reconcile,FILE_URL} from './github.mjs';
+const cloud=new GitHubLibrary(), META='proximo-jogo.github.base.v1';
+let base={}, cloudBusy=false, cloudMessage='Consultando biblioteca pública…', conflict=false, remoteKnown=false, dirty=true;
+try {const m=JSON.parse(localStorage.getItem(META)||'{}');if(/^[a-f0-9]{40}$/.test(m.sha)&&/^[a-f0-9]{64}$/.test(m.hash))base={sha:m.sha,hash:m.hash};}catch{}
 const $=id=>document.getElementById(id), KEY='proximo-jogo.library.v1';
 let data=emptyLibrary(), raw=null, view='backlog', page=0, shown=[], toastTimer, fatal=false;
 const PAGE_SIZE=30;
@@ -15,7 +19,7 @@ try {
   localStorage.removeItem('proximo-jogo.google.v1');
 } catch(error) { fatal=true;toast('Não foi possível ler seus dados locais. Eles não foram apagados. Exporte o backup para recuperação antes de importar uma biblioteca válida.',true); }
 async function commit(transform,{allowRecovery=false}={}) {
-  if(fatal&&!allowRecovery)throw new Error('Os dados locais precisam ser recuperados. Use Dados & backup.');
+  if(fatal&&!allowRecovery)throw new Error('Os dados locais precisam ser recuperados. Use Dados & GitHub.');
   const operation=async()=>{
     const current=localStorage.getItem(KEY);
     if(current!==raw) {raw=current;data=current?validateLibrary(JSON.parse(current)):emptyLibrary();render();throw new Error('Outra aba alterou a biblioteca. Os dados foram recarregados; repita sua ação.');}
@@ -57,7 +61,7 @@ function render() {
   $('random-button').disabled=backlog.length===0;
   const requests=data.requests.filter(r=>r.profileVersion===data.profileVersion);
   $('request-status').textContent=`${requests.length} pedidos em andamento · ${requests.reduce((n,r)=>n+r.ids.length,0)} jogos aguardando resposta.`;
-  $('local-status').textContent=fatal?'Armazenamento precisa de recuperação. Abra Dados & backup.':'Salvo neste navegador · faça backups para guardar suas avaliações.';
+  refreshCloudStatus();
 }
 function openRating(game) { $('rating-id').value=game.id;$('rating-game').textContent=game.title;$('rating-score').value=game.rating??'';$('rating-comment').value=game.comment;dialog('rating-dialog'); }
 function showDetail(game,random) {
@@ -93,4 +97,85 @@ async function importAI(text) {let result;await commit(current=>{result=importPr
 $('import-ai').onclick=guard(()=>importAI($('ai-response').value));$('upload-ai').onclick=()=>$('ai-file').click();
 $('ai-file').onchange=guard(async event=>{const file=event.target.files[0];event.target.value='';if(!file)return;if(file.size>15_000_000)throw new Error('Limite: 15 MB.');await importAI(await file.text());});
 $('clear-requests').onclick=guard(async()=>{if(!data.requests.length)return;if(!confirm('Descartar os pedidos em andamento? Respostas desses pedidos não poderão mais ser importadas. Nenhuma nota atual será alterada.'))return;await commit(current=>{current.requests=[];return current;});toast('Pedido descartado. Você pode gerar outro.');});
+
+function rememberBase(sha,hash){base={sha,hash};localStorage.setItem(META,JSON.stringify(base));}
+async function refreshCloudStatus(){
+  const snapshot=data;
+  let hash;try{hash=await fingerprint(snapshot);}catch{return;}
+  if(snapshot!==data)return;
+  dirty=hash!==base.hash;
+  const message=fatal?'Dados locais precisam de recuperação. Exporte seu backup.':cloudBusy?'Consultando ou salvando no GitHub…':conflict?'Conflito: cópias local e GitHub diferentes. Abra Dados & GitHub.':cloudMessage||(!remoteKnown?'GitHub não verificado. Sua cópia local foi preservada.':dirty?'Alterações locais ainda não publicadas no GitHub.':'Biblioteca igual à última versão consultada no GitHub.');
+  $('local-status').textContent=message;
+  $('github-status').textContent=message;
+  $('github-auth').textContent=cloud.connected?'Token disponível nesta aba; permissão de escrita será verificada no envio.':'Leitura pública · conecte um token para escrever.';
+  $('github-conflict').hidden=!conflict;
+  for(const id of ['github-save','github-refresh','github-local','github-remote','token-submit'])$(id).disabled=cloudBusy||fatal;
+  $('github-save').disabled=cloudBusy||fatal||conflict||!remoteKnown||!dirty;
+  $('github-disconnect').disabled=!cloud.connected||cloudBusy;
+}
+async function cloudOperation(fn){
+  if(cloudBusy)throw new Error('Aguarde a operação do GitHub em andamento.');
+  cloudBusy=true;cloudMessage='';refreshCloudStatus();
+  try{await fn();}
+  catch(error){cloudMessage=error.message;if(error.status===409||error.status===422){conflict=true;remoteKnown=false;}throw error;}
+  finally{cloudBusy=false;refreshCloudStatus();}
+}
+async function readCloud(mode='auto'){
+  await cloudOperation(async()=>{
+    const remote=await cloud.read();
+    if(fatal)throw new Error('Recupere ou exporte seus dados locais antes de carregar o GitHub.');
+    const capturedRaw=raw, snapshot=data;
+    const [localHash,remoteHash]=await Promise.all([fingerprint(snapshot),fingerprint(remote.data)]);
+    if(raw!==capturedRaw||localStorage.getItem(KEY)!==capturedRaw)throw new Error('Outra edição ocorreu durante a consulta. Tente novamente.');
+    const decision=reconcile({localHash,remoteHash,baseHash:base.hash,baseSha:base.sha,remoteSha:remote.sha,hasLocal:!!raw});
+    if(mode==='remote'){
+      if(localHash!==remoteHash&&!confirm('Substituir sua cópia local pela biblioteca atual do GitHub? Suas mudanças locais não serão mescladas. Um backup local será baixado.'))return;
+      if(localHash!==remoteHash)download('biblioteca-local-antes-do-github.json',JSON.stringify(publicLibrary(snapshot),null,2));
+    }else if(decision==='conflict'){
+      conflict=true;remoteKnown=false;return;
+    }
+    if(mode==='remote'||decision==='remote'){
+      if(localHash!==remoteHash || !raw)await commit(current=>{
+        if(comparable(current)!==comparable(snapshot))throw new Error('A biblioteca mudou durante a consulta. Tente novamente.');
+        return remote.data;
+      });
+      rememberBase(remote.sha,remoteHash);conflict=false;remoteKnown=true;
+    }else{remoteKnown=true;conflict=false;}
+  });
+}
+async function saveCloud(replace=false){
+  if(!cloud.connected){openSettings();throw new Error('Informe o token em Dados & GitHub. Nunca publique o token.');}
+  await cloudOperation(async()=>{
+    if(fatal||localStorage.getItem(KEY)!==raw)throw new Error('Os dados locais mudaram ou precisam de recuperação. Recarregue antes de salvar.');
+    let sha=base.sha;
+    if(replace){
+      const remote=await cloud.read();sha=remote.sha;
+      if(!confirm('Publicar sua cópia LOCAL inteira no lugar da versão do GitHub? Isso substitui também notas e comentários remotos, sem mesclar. Uma cópia remota será baixada; o histórico Git continua disponível.'))return;
+      download('biblioteca-github-antes-da-substituicao.json',JSON.stringify(remote.data,null,2));
+    }else if(conflict||!remoteKnown)throw new Error('Leia a versão do GitHub e resolva qualquer conflito antes de salvar.');
+    const snapshot=publicLibrary(data), capturedRaw=raw;
+    if(!snapshot.games.length)throw new Error('A biblioteca está vazia. Salvamento remoto bloqueado para evitar apagar o catálogo.');
+    if(!replace&&!confirm('Publicar jogos, perfil, notas, comentários, previsões e pedidos de IA em biblioteca.json? O conteúdo será público e ficará no histórico do GitHub.'))return;
+    if(localStorage.getItem(KEY)!==capturedRaw)throw new Error('Outra aba alterou a biblioteca. Recarregue antes de enviar.');
+    const result=await cloud.save(snapshot,sha);
+    rememberBase(result.sha,await fingerprint(snapshot));remoteKnown=true;conflict=false;cloudMessage='';
+    toast('Biblioteca salva no GitHub.'+(comparable(data)!==comparable(snapshot)?' Há novas alterações locais ainda não enviadas.':''));
+  });
+}
+$('github-token-form').onsubmit=guard(async event=>{
+  event.preventDefault();
+  const field=$('github-token');try{cloud.connect(field.value);}finally{field.value='';}
+  await readCloud();toast('Token mantido somente nesta aba. Use Salvar no GitHub para publicar.');
+});
+$('github-disconnect').onclick=()=>{cloud.disconnect();$('github-token').value='';refreshCloudStatus();toast('Token removido da memória desta aba.');};
+$('github-save').onclick=guard(()=>saveCloud());
+$('github-refresh').onclick=guard(()=>readCloud());
+$('github-remote').onclick=guard(()=>readCloud('remote'));
+$('github-local').onclick=guard(()=>saveCloud(true));
+$('view-json').onclick=guard(()=>{$('json-preview').value=JSON.stringify(publicLibrary(data));$('json-preview').hidden=false;});
+window.addEventListener('pagehide',()=>{cloud.disconnect();$('github-token').value='';});
+window.addEventListener('pageshow',()=>refreshCloudStatus());
+window.addEventListener('beforeunload',event=>{if(dirty&&data.games.length){event.preventDefault();event.returnValue='';}});
+window.addEventListener('storage',event=>{if(event.key===META){remoteKnown=false;cloudMessage='Outra aba salvou no GitHub. Consulte a versão remota antes de enviar.';refreshCloudStatus();}});
 render();
+readCloud().catch(()=>{});
